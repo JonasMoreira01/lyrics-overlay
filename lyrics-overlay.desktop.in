@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lyrics Overlay
+Comment=Letra sincronizada e tradução da música que está tocando
+Exec=@EXEC@
+Icon=lyrics-overlay
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+StartupNotify=false
