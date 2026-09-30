@@ -42,7 +42,7 @@ fi
 
 # --- arquivos do app
 mkdir -p "$APP" "$BIN" "$DATA/applications" "$DATA/icons/hicolor/scalable/apps"
-cp "$SRC/lyrics_overlay.py" "$APP/"
+cp "$SRC"/*.py "$APP/"
 mkdir -p "$APP/icons" && cp "$SRC"/icons/*.svg "$APP/icons/"
 cp "$SRC/icons/lyrics-overlay.svg" "$DATA/icons/hicolor/scalable/apps/lyrics-overlay.svg"
 
