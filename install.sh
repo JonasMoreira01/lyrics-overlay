@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Instala o Lyrics Overlay para o usuario atual (sem sudo).
-#   ./install.sh               instalacao completa (inclui tradutor offline, ~200MB)
+#   ./install.sh               instalacao completa (inclui tradutor offline, centenas de MB)
 #   ./install.sh --lite        sem tradutor offline (traducao cai no Google, que pode bloquear)
 #   ./install.sh --autostart   tambem inicia com a sessao
 set -euo pipefail
@@ -51,16 +51,18 @@ python3 -m venv --system-site-packages "$APP/venv"
 PIP_OPTS=(-q --no-warn-conflicts --disable-pip-version-check)
 "$APP/venv/bin/pip" install "${PIP_OPTS[@]}" requests
 if [ "$LITE" -eq 0 ]; then
-  echo "Instalando tradutor offline (download de ~200MB)..."
+  echo "Instalando tradutor offline (download de centenas de MB)..."
   "$APP/venv/bin/pip" install "${PIP_OPTS[@]}" argostranslate
   "$APP/venv/bin/python" - <<'PY'
 import argostranslate.package as p
 installed = {(l.from_code, l.to_code) for l in p.get_installed_packages()}
-if ("en", "pt") not in installed:
+missing = [pair for pair in (("en", "pt"), ("pt", "en")) if pair not in installed]
+if missing:
     p.update_package_index()
-    pkg = next(x for x in p.get_available_packages() if x.from_code == "en" and x.to_code == "pt")
-    p.install_from_path(pkg.download())
-print("Modelo EN->PT pronto.")
+    for src, dst in missing:
+        pkg = next(x for x in p.get_available_packages() if x.from_code == src and x.to_code == dst)
+        p.install_from_path(pkg.download())
+print("Modelos EN->PT e PT->EN prontos.")
 PY
 fi
 

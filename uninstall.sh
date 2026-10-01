@@ -17,7 +17,8 @@ fi
 rm -f "$HOME/.local/bin/lyrics-overlay" \
       "$DATA/applications/lyrics-overlay.desktop" \
       "$DATA/icons/hicolor/scalable/apps/lyrics-overlay.svg" \
-      "$CONFIG/autostart/lyrics-overlay.desktop"
+      "$CONFIG/autostart/lyrics-overlay.desktop" \
+      "$CONFIG/lyrics-overlay/spotify.json"   # credencial: nunca fica para tras
 
 if [ "${1:-}" = "--purge" ]; then
   rm -rf "$CONFIG/lyrics-overlay" "$CACHE/lyrics-overlay"

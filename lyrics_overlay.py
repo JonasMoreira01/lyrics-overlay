@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -23,6 +24,8 @@ from pathlib import Path
 import gi
 import requests
 
+import language
+import spotify_remote
 import study
 
 gi.require_version("Gtk", "3.0")
@@ -67,13 +70,17 @@ SIZES = {
 CORNERS = ("bottom-right", "bottom-left", "top-right", "top-left")
 MARGIN = 8
 NUDGE = 0.5  # segundos por clique no ajuste de sincronia
+UI_VERSION = 2  # sobe quando o visual muda e os padroes de aparencia precisam ser reaplicados
 DEFAULTS = {
+    "ui_version": UI_VERSION,
     "translate": True,
     "size": "medium",
-    "opacity": 0.6,
+    "opacity": 0.82,
     "corner": "bottom-right",
     "monitor": -1,
     "autohide": False,
+    "spotify_client_id": "",
+    "controls": True,  # controles de midia ao passar o mouse
     "pause_on_lookup": True,
     "offsets": {},  # track_key -> segundos
 }
@@ -94,18 +101,39 @@ DEMO_LINES = [
 DEMO_LENGTH = 34.0
 
 
+SPOTIFY_HELP = (
+    "Para mostrar a letra do que toca no <b>celular</b>, o app consulta a API do Spotify "
+    "(precisa de conta <b>Premium</b>). Configuração, uma vez só:\n\n"
+    "1. Em <a href=\"https://developer.spotify.com/dashboard\">developer.spotify.com/dashboard</a> crie um app.\n"
+    "2. Em <i>Redirect URIs</i> adicione exatamente: <tt>" + spotify_remote.REDIRECT_URI + "</tt>\n"
+    "3. Marque <i>Web API</i>. Se depois aparecer erro de acesso negado, adicione seu e-mail em "
+    "<i>Settings → User Management</i>.\n"
+    "4. Cole abaixo o <i>Client ID</i> do app:"
+)
+
+
 def build_css(size, opacity):
     s = SIZES[size]
     return f"""
 window {{ background-color: transparent; }}
-#box {{ background-color: rgba(0, 0, 0, {opacity}); border-radius: 10px; padding: 8px 14px; }}
-#cur {{ color: #ffffff; font-size: {s['cur']}px; font-weight: bold; }}
+#box {{ background-color: rgba(14, 14, 20, {opacity}); border-radius: 12px; padding: 9px 16px;
+       border: 1px solid rgba(255, 255, 255, 0.08); }}
+#cur {{ color: #ffffff; font-size: {s['cur']}px; font-weight: 700; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75); }}
 #cur link {{ color: #9ecbff; }}
-#tr  {{ color: #ffd166; font-size: {s['tr']}px; }}
-#nxt {{ color: #9a9a9a; font-size: {s['nxt']}px; }}
+#tr  {{ color: #ffd166; font-size: {s['tr']}px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75); }}
+#tr link {{ color: #fff0b3; }}
+#nxt {{ color: #a3a3ad; font-size: {s['nxt']}px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75); }}
+#progress {{ min-height: 2px; }}
+#progress trough {{ min-height: 2px; border: none; border-radius: 1px; background-color: rgba(255, 255, 255, 0.14); }}
+#progress progress {{ min-height: 2px; border: none; border-radius: 1px; background-color: #8ab4ff; }}
 #infobox {{ background-color: rgba(45, 45, 95, 0.90); border-radius: 8px; padding: 6px 10px; }}
 #info {{ color: #ffffff; font-size: {s['tr']}px; }}
 #infobox button {{ font-size: {s['nxt']}px; padding: 1px 8px; min-height: 0; min-width: 0; }}
+#controls {{ background-color: rgba(255, 255, 255, 0.09); border-radius: 14px; padding: 1px 5px; }}
+#controls button {{ color: #ffffff; background: transparent; border: none; box-shadow: none;
+                   padding: 1px 11px; min-height: 0; min-width: 0; border-radius: 12px; }}
+#controls button:hover {{ background: rgba(255, 255, 255, 0.22); }}
+#controls button:active {{ background: rgba(255, 255, 255, 0.34); }}
 """.encode()
 
 
@@ -118,6 +146,9 @@ def load_config():
     except (OSError, ValueError):
         stored = {}
     cfg.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    if stored.get("ui_version", 1) < UI_VERSION:  # visual novo: o fundo antigo (60%) deixava o fundo da tela vazar
+        cfg["opacity"] = DEFAULTS["opacity"]
+    cfg["ui_version"] = UI_VERSION
     cfg["offsets"] = dict(cfg["offsets"])  # copia: nao mutar DEFAULTS
     if cfg["size"] not in SIZES:
         cfg["size"] = DEFAULTS["size"]
@@ -192,10 +223,10 @@ def fetch_lyrics(artist, title, album, duration):
     return parse_lrc(synced) or None
 
 
-def translate_google(text):
+def translate_google(text, src="en", dst="pt"):
     r = requests.get(
         "https://translate.googleapis.com/translate_a/single",
-        params={"client": "gtx", "sl": "en", "tl": "pt", "dt": "t", "q": text},
+        params={"client": "gtx", "sl": src, "tl": dst, "dt": "t", "q": text},
         headers=UA, timeout=6,
     )
     r.raise_for_status()
@@ -203,23 +234,23 @@ def translate_google(text):
 
 
 class OfflineUnavailable(Exception):
-    """argostranslate ausente ou sem o modelo EN->PT."""
+    """argostranslate ausente ou sem o modelo do par de idiomas."""
 
 
-def translate_argos(text):
+def translate_argos(text, src="en", dst="pt"):
     try:
         import argostranslate.translate as t
-        return t.translate(text, "en", "pt")
-    except (ImportError, AttributeError) as e:  # AttributeError: modelo EN->PT nao instalado
+        return t.translate(text, src, dst)
+    except (ImportError, AttributeError) as e:  # AttributeError: modelo do par nao instalado
         raise OfflineUnavailable(str(e)) from e
 
 
-def translate(text):
+def translate(text, src="en", dst="pt"):
     """Offline (argostranslate) se disponivel; senao Google gtx (sujeito a 429)."""
     try:
-        return translate_argos(text)
+        return translate_argos(text, src, dst)
     except OfflineUnavailable:
-        return translate_google(text)
+        return translate_google(text, src, dst)
 
 
 def split_stanzas(lines, max_len=8):
@@ -239,16 +270,16 @@ def split_stanzas(lines, max_len=8):
     return blocks
 
 
-def translate_block(block):
+def translate_block(block, src_lang="en", dst_lang="pt"):
     """Traduz a estrofe inteira (o contexto melhora o resultado); se a contagem de linhas
     nao bater, volta para linha a linha. Retorna {linha_original: traducao}."""
     try:
-        parts = translate("\n".join(block)).split("\n")
+        parts = translate("\n".join(block), src_lang, dst_lang).split("\n")
         if len(parts) == len(block):
             return {src: dst.strip() for src, dst in zip(block, parts)}
     except Exception:
         pass
-    return {src: translate(src) for src in block}
+    return {src: translate(src, src_lang, dst_lang) for src in block}
 
 
 def words_markup(text):
@@ -284,12 +315,26 @@ class Overlay(Gtk.Window):
         self.idx = -2
         self.proxy = None
         self.last_player = None    # nome D-Bus do ultimo player tocando
+        self.source = None         # "mpris" | "spotify" (Web API): de onde veio a faixa atual
+        self.remote = None         # SpotifyRemote quando a conta esta conectada
+        self.remote_connecting = False
+        self.remote_error = ""
+        self._remote_status = None
         self.paused_by_us = False
         self.cur_text = ""
+        self.tr_text = ""
+        self.src_lang = None       # idioma da letra: "en" | "pt" | None (desconhecido: sem traducao)
+        self.dst_lang = None       # idioma da traducao (en<->pt)
         self.lookup = None
         self.lookup_ticket = 0
         self.demo_t0 = time.monotonic()
         self.on_state_change = None  # a bandeja atualiza o rotulo de sincronia
+        self.cmd_queue = queue.Queue()  # comandos de midia para o Spotify: uma fila, para manter a ordem dos cliques
+        threading.Thread(target=self._cmd_worker, daemon=True).start()
+        self.duration = 0            # duracao da faixa atual (s), para a barra de progresso
+        self.hover = False           # ponteiro sobre a janela (controles de midia visiveis)
+        self.outside_since = None
+        self.playing = None          # None = ainda nao sabemos (forca atualizar o icone de play/pause)
 
         self.set_title("Lyrics Overlay")
         self.set_decorated(False)
@@ -307,7 +352,7 @@ class Overlay(Gtk.Window):
         self.css = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_screen(self.get_screen(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         self.box.set_name("box")
         self.cur, self.tr, self.nxt = (Gtk.Label() for _ in range(3))
         for name, lbl in (("cur", self.cur), ("tr", self.tr), ("nxt", self.nxt)):
@@ -315,7 +360,34 @@ class Overlay(Gtk.Window):
             lbl.set_line_wrap(True)
             lbl.set_justify(Gtk.Justification.CENTER)
             self.box.pack_start(lbl, False, False, 0)
-        self.cur.connect("activate-link", self.on_word_link)
+        # modo estudo: a linha em INGLES (original ou traducao) tem palavras clicaveis
+        self.cur.connect("activate-link", lambda _l, uri: self.on_word_link(uri, self.cur_text))
+        self.tr.connect("activate-link", lambda _l, uri: self.on_word_link(uri, self.tr_text))
+
+        # controles de midia: so aparecem com o mouse em cima
+        self.controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        self.controls.set_name("controls")
+        self.controls.set_halign(Gtk.Align.CENTER)
+        self.btn_prev = self.make_control("media-skip-backward-symbolic", "Música anterior", "Previous")
+        self.btn_play = self.make_control("media-playback-start-symbolic", "Pausar / tocar", "PlayPause")
+        self.btn_next = self.make_control("media-skip-forward-symbolic", "Próxima música", "Next")
+        for b in (self.btn_prev, self.btn_play, self.btn_next):
+            self.controls.pack_start(b, False, False, 0)
+        self.controls.set_valign(Gtk.Align.CENTER)
+
+        # barra fina com o progresso da musica
+        self.progress = Gtk.ProgressBar()
+        self.progress.set_name("progress")
+        self.progress.set_valign(Gtk.Align.CENTER)
+
+        # Rodape de altura fixa: mostra o progresso e, com o mouse em cima, troca pelos controles.
+        # A altura da janela nao muda, entao a letra nao se mexe.
+        self.footer = Gtk.Stack()
+        self.footer.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.footer.set_transition_duration(120)
+        self.footer.add_named(self.progress, "progress")
+        self.footer.add_named(self.controls, "controls")
+        self.box.pack_start(self.footer, False, False, 0)
 
         # painel de consulta de palavra (modo estudo)
         self.info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -348,8 +420,26 @@ class Overlay(Gtk.Window):
         self.show_all()
         self.tr.set_visible(False)
         self.info_box.hide()
+        self.progress.set_opacity(0.0)  # transparente ate a posicao ser conhecida; nunca hide(): o Stack do
+                                        # rodape mostraria os controles no lugar do filho escondido
 
         GLib.timeout_add(150, self.tick)
+
+    def _cmd_worker(self):
+        while True:
+            fn = self.cmd_queue.get()
+            try:
+                fn()
+            except Exception:
+                pass  # melhor esforco: o proximo ciclo de consulta mostra o estado real
+
+    def make_control(self, icon, tip, method):
+        btn = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        btn.set_tooltip_text(tip)
+        btn.set_can_focus(False)
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.connect("clicked", lambda *_: self.player_call(method))
+        return btn
 
     # -- janela e aparencia
 
@@ -362,14 +452,50 @@ class Overlay(Gtk.Window):
         self.resize(1, 1)
 
     def apply_input_shape(self):
-        """Fora do modo estudo a janela ignora cliques; no modo estudo recebe."""
+        """A janela ignora cliques, exceto no modo estudo ou com o mouse em cima (controles)."""
         win = self.get_window()
         if not win:
             return
+        interactive = self.study or self.hover
         if hasattr(win, "set_pass_through"):  # GTK >= 3.18
-            win.set_pass_through(not self.study)
-        elif cairo and not self.study:
+            win.set_pass_through(not interactive)
+        elif cairo and not interactive:
             win.input_shape_combine_region(cairo.Region(), 0, 0)
+
+    def set_progress(self, pos, duration):
+        if duration and duration > 0:
+            self.progress.set_fraction(max(0.0, min(pos / duration, 1.0)))
+            self.progress.set_opacity(1.0)
+
+    def pointer_position(self):
+        seat = Gdk.Display.get_default().get_default_seat()
+        _screen, x, y = seat.get_pointer().get_position()
+        return x, y
+
+    def update_hover(self):
+        """A janela ignora cliques, entao nao recebe eventos de 'mouse em cima': olhamos a posicao
+        do ponteiro. Ao entrar mostra os controles e passa a aceitar cliques; ao sair espera 0,4 s."""
+        inside = False
+        if self.cfg["controls"] and self.get_visible():
+            px, py = self.pointer_position()
+            wx, wy = self.get_position()
+            ww, wh = self.get_size()
+            inside = wx <= px < wx + ww and wy <= py < wy + wh
+        now = time.monotonic()
+        if inside:
+            self.outside_since = None
+            target = True
+        elif self.hover:
+            if self.outside_since is None:
+                self.outside_since = now
+            target = (now - self.outside_since) < 0.4
+        else:
+            target = False
+        if target != self.hover:
+            self.hover = target
+            self.outside_since = None
+            self.footer.set_visible_child_name("controls" if target else "progress")
+            self.apply_input_shape()
 
     def monitor_index(self):
         return self.args.monitor if self.args.monitor is not None else self.cfg["monitor"]
@@ -401,6 +527,10 @@ class Overlay(Gtk.Window):
             self.idle_since = None
         elif self.idle_since is None:
             self.idle_since = time.monotonic()
+        if playing != self.playing:  # o botao mostra a acao: pausar enquanto toca, tocar quando pausado
+            self.playing = playing
+            icon = "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
+            self.btn_play.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
         self.apply_visibility()
 
     # -- opcoes (chamadas pela bandeja)
@@ -429,6 +559,7 @@ class Overlay(Gtk.Window):
         self.study = on
         self.apply_input_shape()
         self.render_cur()
+        self.render_tr()
         if not on:
             self.hide_info()
 
@@ -485,8 +616,17 @@ class Overlay(Gtk.Window):
         return res.unpack()[0]
 
     def player_call(self, method):
-        """Pause/Play no ultimo player tocando."""
-        if self.args.demo or not self.last_player:
+        """Comando de midia no ultimo player tocando (MPRIS, ou Spotify Web API quando a faixa veio de la).
+        method: Play, Pause, PlayPause, Next, Previous (nomes do MPRIS)."""
+        if self.args.demo:
+            return
+        if self.source == "spotify" and self.remote:
+            fn = {"Pause": self.remote.pause, "Play": self.remote.play, "PlayPause": self.remote.toggle,
+                  "Next": self.remote.next, "Previous": self.remote.previous}.get(method)
+            if fn:
+                self.cmd_queue.put(fn)  # rede: fora da thread da interface, e em ordem
+            return
+        if not self.last_player:
             return
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -496,7 +636,20 @@ class Overlay(Gtk.Window):
             pass
 
     def read_player(self):
-        """(artist, title, album, duration) do player tocando, ou None."""
+        """(artist, title, album, duration) do que esta tocando: player local (MPRIS) primeiro,
+        depois o Spotify Web API (celular ou outro aparelho da conta). None se nada toca."""
+        meta = self.read_mpris()
+        if meta:
+            self.source = "mpris"
+            return meta
+        s = self.remote.snapshot() if self.remote else None
+        if s and s["is_playing"]:
+            self.source = "spotify"
+            return s["artist"], s["title"], s["album"], s["duration"]
+        return None
+
+    def read_mpris(self):
+        """(artist, title, album, duration) do player MPRIS tocando, ou None."""
         if self.proxy and self.get_prop("PlaybackStatus") != "Playing":
             self.proxy = None  # pausou/fechou -> procura outro que esteja tocando
         if not self.proxy and not self.find_player():
@@ -514,26 +667,32 @@ class Overlay(Gtk.Window):
 
     def set_text(self, cur="", tr="", nxt=""):
         self.cur_text = cur
+        self.tr_text = tr
         self.render_cur()
-        self.tr.set_text(tr)
-        self.tr.set_visible(bool(tr) and self.translate_on)
+        self.render_tr()
         self.nxt.set_text(nxt)
         self.nxt.set_visible(bool(nxt))
 
     def render_cur(self):
-        if self.study and self.cur_text:
+        if self.study and self.src_lang == "en" and self.cur_text:
             self.cur.set_markup(words_markup(self.cur_text))
         else:
             self.cur.set_text(self.cur_text)
 
+    def render_tr(self):
+        if self.study and self.dst_lang == "en" and self.tr_text:
+            self.tr.set_markup(words_markup(self.tr_text))
+        else:
+            self.tr.set_text(self.tr_text)
+        self.tr.set_visible(bool(self.tr_text) and self.translate_on)
+
     def refresh_line(self):
         """Reaplica a traducao da linha atual (chegou depois da linha na tela, ou o toggle mudou)."""
         if 0 <= self.idx < len(self.lines):
-            tr = self.trans.get(self.lines[self.idx][1], "")
-            self.tr.set_text(tr)
-            self.tr.set_visible(bool(tr) and self.translate_on)
+            self.tr_text = self.trans.get(self.lines[self.idx][1], "")
         else:
-            self.tr.set_visible(False)
+            self.tr_text = ""
+        self.render_tr()
         return False
 
     # -- loop principal
@@ -541,6 +700,11 @@ class Overlay(Gtk.Window):
     def tick(self):
         try:
             self.update()
+            self.update_hover()
+            status = self.remote_status()
+            if status != self._remote_status:  # o rotulo do menu acompanha a conexao
+                self._remote_status = status
+                self.notify_state()
         except GLib.Error:
             self.proxy = None
             self.track = None
@@ -559,8 +723,11 @@ class Overlay(Gtk.Window):
         if (artist, title) != self.track:
             self.track = (artist, title)
             self.lines, self.times, self.trans, self.idx = [], [], {}, -2
+            self.src_lang = self.dst_lang = None
             self.tr_gen += 1
             self.hide_info(resume=False)
+            self.duration = duration
+            self.progress.set_opacity(0.0)  # volta quando a posicao for conhecida (letra carregada)
             self.notify_state()
             if self.args.demo:
                 self.apply_lyrics(artist, title, DEMO_LINES)
@@ -572,8 +739,13 @@ class Overlay(Gtk.Window):
             return
         if self.args.demo:
             pos = (time.monotonic() - self.demo_t0) % DEMO_LENGTH
+        elif self.source == "spotify":
+            pos = self.remote.position() if self.remote else None
+            if pos is None:
+                return
         else:
             pos = self.get_prop("Position") / 1e6
+        self.set_progress(pos, self.duration)  # progresso real, sem o ajuste de sincronia da letra
         pos += self.args.offset + self.track_offset()
         i = bisect.bisect_right(self.times, pos) - 1
         if i == self.idx:
@@ -597,25 +769,34 @@ class Overlay(Gtk.Window):
             self.set_text("", "", f"{title} - {artist}\nletra sincronizada nao encontrada")
             return
         self.lines, self.times, self.idx = lines, [t for t, _ in lines], -2
+        # EN -> PT, PT -> EN. Outro idioma (ou texto curto demais): nao traduz.
+        self.src_lang = language.detect_language([t for _, t in lines])
+        self.dst_lang = {"en": "pt", "pt": "en"}.get(self.src_lang)
         self.set_text("", "", lines[0][1])
         self.start_translation()
 
     def start_translation(self):
-        if not (self.translate_on and self.track and self.lines):
+        if not (self.translate_on and self.track and self.lines and self.dst_lang):
             return
         self.tr_gen += 1
-        threading.Thread(target=self.translate_all, args=(self.tr_gen, self.track, self.lines), daemon=True).start()
+        args = (self.tr_gen, self.track, self.lines, self.src_lang, self.dst_lang)
+        threading.Thread(target=self.translate_all, args=args, daemon=True).start()
 
-    def translate_all(self, gen, track, lines):
+    def translate_all(self, gen, track, lines, src_lang, dst_lang):
         def stale():
             return gen != self.tr_gen or not self.translate_on or self.track != track
 
-        # sufixo .pt2: traducao por estrofe (o .pt.json antigo era linha a linha)
-        cache = CACHE_DIR / f"{track_key(*track)}.pt2.json"
+        # <destino>2.json: traducao por estrofe (o .pt.json antigo era linha a linha)
+        cache = CACHE_DIR / f"{track_key(*track)}.{dst_lang}2.json"
         if cache.exists():
-            self.trans = json.loads(cache.read_text())
-            GLib.idle_add(self.refresh_line)
-            return
+            try:
+                cached = json.loads(cache.read_text())
+            except ValueError:
+                cached = {}
+            if all(text in cached for _, text in lines if text):  # cache de outra versao da letra: refaz
+                self.trans = cached
+                GLib.idle_add(self.refresh_line)
+                return
         blocks = split_stanzas(lines)
         # Comeca pela estrofe da linha atual, para a tela ter traducao o quanto antes.
         cur_text = lines[max(self.idx, 0)][1]
@@ -627,7 +808,7 @@ class Overlay(Gtk.Window):
             if all(text in out for text in block):
                 continue
             try:
-                out.update(translate_block(block))
+                out.update(translate_block(block, src_lang, dst_lang))
                 fails = 0
             except Exception:
                 fails += 1
@@ -644,11 +825,11 @@ class Overlay(Gtk.Window):
 
     # -- modo estudo: consulta de palavra e vocabulario
 
-    def on_word_link(self, _label, uri):
+    def on_word_link(self, uri, line):
+        """line = a linha em ingles de onde veio a palavra (original ou traducao)."""
         if not uri.startswith("word:"):
             return False
         word = uri[len("word:"):]
-        line = self.cur_text
         self.lookup_ticket += 1
         ticket = self.lookup_ticket
         self.lookup = None
@@ -670,7 +851,7 @@ class Overlay(Gtk.Window):
         except requests.RequestException:
             pass
         try:
-            tr = translate(word).strip().rstrip(".!")
+            tr = translate(word, "en", "pt").strip().rstrip(".!")  # a palavra consultada e sempre em ingles
             tr = tr[:1].lower() + tr[1:]
         except Exception:
             pass
@@ -733,6 +914,101 @@ class Overlay(Gtk.Window):
         except GLib.Error:
             pass
 
+    # -- Spotify Web API (musica tocando no celular ou em outro aparelho da conta)
+
+    def init_remote(self):
+        """Retoma a consulta se ja houver conta conectada."""
+        if self.remote:
+            self.remote.stop()
+        remote = spotify_remote.SpotifyRemote()
+        if remote.connected:
+            remote.start()
+            self.remote, self.remote_error = remote, ""
+        else:
+            self.remote = None
+
+    def remote_status(self):
+        if self.remote_connecting:
+            return "aguardando autorização no navegador…"
+        if self.remote is None:
+            return self.remote_error or "desconectado"
+        if self.remote.error:
+            return self.remote.error
+        s = self.remote.snapshot()
+        return "conectado (tocando)" if s and s["is_playing"] else "conectado"
+
+    def ask_client_id(self):
+        dlg = Gtk.Dialog(title="Conectar ao Spotify")
+        dlg.set_keep_above(True)
+        dlg.set_default_size(560, 1)  # altura minima: sem espaco vazio antes dos botoes
+        dlg.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Conectar", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        area = dlg.get_content_area()
+        area.set_spacing(8)
+        area.set_border_width(12)
+        label = Gtk.Label()
+        label.set_markup(SPOTIFY_HELP)
+        label.set_line_wrap(True)
+        label.set_xalign(0)
+        label.set_selectable(True)
+        label.set_max_width_chars(70)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Client ID")
+        entry.set_text(self.cfg["spotify_client_id"])
+        entry.set_activates_default(True)
+        area.pack_start(label, False, False, 0)
+        area.pack_start(entry, False, False, 0)
+        dlg.show_all()
+        ok = dlg.run() == Gtk.ResponseType.OK
+        client_id = entry.get_text().strip()
+        dlg.destroy()
+        return client_id if ok else ""
+
+    def connect_spotify(self):
+        if self.remote_connecting:
+            return
+        client_id = self.ask_client_id()
+        if not client_id:
+            return
+        self.cfg["spotify_client_id"] = client_id
+        save_config(self.cfg)
+        self.remote_connecting, self.remote_error = True, ""
+        self.notify_state()
+        threading.Thread(target=self._auth_thread, args=(client_id,), daemon=True).start()
+
+    def _auth_thread(self, client_id):
+        err = ""
+        try:
+            spotify_remote.authorize(client_id, lambda url: GLib.idle_add(self._open_url, url))
+        except spotify_remote.AuthError as e:
+            err = str(e)
+        except (OSError, requests.RequestException) as e:
+            err = "falha de rede: " + str(e)[:80]
+        GLib.idle_add(self._auth_done, err)
+
+    def _open_url(self, url):
+        try:
+            Gio.AppInfo.launch_default_for_uri(url, None)
+        except GLib.Error:
+            self.remote_error = "não consegui abrir o navegador"
+        return False
+
+    def _auth_done(self, err):
+        self.remote_connecting = False
+        if err:
+            self.remote_error = err
+        else:
+            self.init_remote()
+        self.notify_state()
+        return False
+
+    def disconnect_spotify(self):
+        if self.remote:
+            self.remote.forget()
+        self.remote, self.remote_error = None, ""
+        self.notify_state()
+
 
 # ---------------------------------------------------------------- bandeja do sistema
 
@@ -783,6 +1059,8 @@ class Tray:
         self.show_item = check_item("Mostrar letra", True, overlay.set_overlay_visible)
         self.offset_label = Gtk.MenuItem(label="")
         self.offset_label.set_sensitive(False)
+        self.spotify_label = Gtk.MenuItem(label="")
+        self.spotify_label.set_sensitive(False)
 
         def set_opt(key, restyle=False):
             return lambda v: overlay.set_setting(key, v, restyle=restyle)
@@ -792,13 +1070,13 @@ class Tray:
         for i in range(display.get_n_monitors()):
             g = display.get_monitor(i).get_geometry()
             monitors.append((i, f"Monitor {i + 1} ({g.width}x{g.height})"))
-        opacities = [(0.85, "Forte (85%)"), (0.6, "Média (60%)"), (0.35, "Leve (35%)")]
+        opacities = [(0.92, "Forte (92%)"), (0.82, "Média (82%)"), (0.6, "Leve (60%)")]
         nearest = min(opacities, key=lambda o: abs(o[0] - cfg["opacity"]))[0]
 
         menu = Gtk.Menu()
         for item in (
             self.show_item,
-            check_item("Traduzir para português", overlay.translate_on, overlay.set_translate),
+            check_item("Traduzir (inglês ⇄ português)", overlay.translate_on, overlay.set_translate),
             check_item("Ocultar quando nada toca", cfg["autohide"], set_opt("autohide")),
             Gtk.SeparatorMenuItem(),
             submenu("Estudo", [
@@ -816,12 +1094,18 @@ class Tray:
                                           ("top-left", "Canto superior esquerdo")],
                               cfg["corner"], set_opt("corner")),
                 radio_submenu("Monitor", monitors, cfg["monitor"], set_opt("monitor")),
+                check_item("Controles de mídia ao passar o mouse", cfg["controls"], set_opt("controls")),
             ]),
             submenu("Sincronia da letra", [
                 self.offset_label,
                 action_item(f"Adiantar letra {NUDGE:.1f} s".replace(".", ","), lambda: overlay.nudge_offset(NUDGE)),
                 action_item(f"Atrasar letra {NUDGE:.1f} s".replace(".", ","), lambda: overlay.nudge_offset(-NUDGE)),
                 action_item("Zerar ajuste desta música", lambda: overlay.nudge_offset(None)),
+            ]),
+            submenu("Spotify (celular)", [
+                self.spotify_label,
+                action_item("Conectar conta…", overlay.connect_spotify),
+                action_item("Desconectar", overlay.disconnect_spotify),
             ]),
             Gtk.SeparatorMenuItem(),
             action_item("Sair", app.quit),
@@ -854,6 +1138,7 @@ class Tray:
         else:
             text = "Nenhuma música tocando"
         self.offset_label.set_label(text)
+        self.spotify_label.set_label("Status: " + ov.remote_status())
 
 
 # ---------------------------------------------------------------- aplicacao (instancia unica)
@@ -875,6 +1160,7 @@ class App(Gio.Application):
         if self.args.no_translate:
             cfg["translate"] = False
         self.overlay = Overlay(self.args, cfg)
+        self.overlay.init_remote()
         self.tray = Tray(self.overlay, self)
 
 
